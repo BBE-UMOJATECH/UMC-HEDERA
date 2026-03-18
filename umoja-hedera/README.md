@@ -1,115 +1,230 @@
-# UMC Stablecoin — USD-Pegged Token on Hedera
+# UMC Stablecoin + Hedera ↔ Polygon Bridge
 
-A secure, upgradeable ERC-20 stablecoin deployed on the Hedera network via the Hedera Smart Contract Service.
+This repository contains a Hedera-based USD-pegged ERC-20 implementation (UMC), a Hedera burn contract, a Polygon mint contract, and a Node/TypeScript relayer that ties the burn/mint flow together. It is intended as a reference implementation and a starting point for production hardening.
 
-## Architecture
+The codebase is split into three domains:
 
-UMC is designed as a reserve-backed stablecoin pegged 1:1 to the US Dollar. The contract uses OpenZeppelin's battle-tested upgradeable contracts with the UUPS proxy pattern, enabling bug fixes and feature additions without redeploying.
+1. On-chain UMC token (Hedera EVM)
+2. Cross-chain bridge contracts (Hedera burn side + Polygon mint side)
+3. Off-chain relayer (Hedera mirror-node poller + Polygon signer/minter)
 
-### Security Features
+From a senior engineering perspective, the operational model is straightforward: **burn on Hedera, attest off-chain, mint on Polygon**. The contracts are upgradeable (UUPS) and use role-based access control throughout.
 
-- **Role-Based Access Control** — Five distinct roles (Admin, Minter, Pauser, Blacklister, Upgrader) following the principle of least privilege. No single key compromise can drain or manipulate the system.
-- **Per-Minter Allowances** — Each minter has a capped allowance, limiting exposure from a compromised minter key.
-- **Supply Cap** — Hard ceiling on total supply prevents unbounded minting.
-- **Blacklisting** — Freeze specific addresses for regulatory compliance (OFAC, AML/KYC).
-- **Pausable** — Emergency kill switch to halt all transfers during incidents.
-- **UUPS Upgradeable** — Proxy pattern allows patching vulnerabilities without migrating balances.
+## Repository Layout
 
-### Token Specifications
+- `UMCToken.sol`: Upgradeable ERC-20 with 6 decimals, supply cap, mint allowance, blacklist, and pause controls.
+- `UMCBridgeHedera.sol`: Burn-side bridge contract for Hedera → Polygon.
+- `UMCBridgePolygon.sol`: Mint-side bridge contract for Hedera → Polygon.
+- `hedera-watcher.ts`: Polls Hedera mirror node logs for burn events.
+- `polygon-minter.ts`: Signs EIP-712 attestations and submits `claimMint` transactions to Polygon.
+- `index.ts`: Relayer entrypoint; orchestrates polling, verification, attestation, and mint submission.
+- `deploy.ts`: Hedera deployment script (direct contract deployment + initializer call).
+- `UMCToken.test.ts`: Hardhat tests for the UMC token.
+- `hardhat.config.ts`: Hardhat build/test config.
+- `package.json`: Tooling and scripts.
 
-| Property | Value |
-|----------|-------|
-| Name | UMC Stablecoin |
-| Symbol | UMC |
-| Decimals | 6 (USD standard, matching USDC/USDT) |
-| Network | Hedera (EVM-compatible via Smart Contract Service) |
-| Standard | ERC-20 |
-| Proxy | UUPS (ERC-1967) |
+## High-Level Architecture
 
-## Quick Start
+**UMC token**
+- Upgradeable UUPS ERC-20 using OpenZeppelin upgradeable libraries.
+- 6 decimals to align with USD stablecoin conventions (USDC/USDT).
+- Supply cap enforced at mint time.
+- Per-minter allowances enforced at mint time.
+- Blacklist enforced on all transfers (excluding mint/burn).
+- Pausable transfers for emergency response.
+
+**Bridge (Hedera → Polygon)**
+- Users burn UMC via `UMCBridgeHedera.bridgeToPolygon`.
+- Burn emits `BridgeBurn` events that the relayer polls from Hedera mirror nodes.
+- Relayer verifies burn records on-chain (Hedera).
+- Relayer signs EIP-712 attestation and submits `claimMint` on Polygon.
+- Polygon bridge verifies signatures and mints UMC on Polygon.
+
+**Security controls**
+- Role-based access control on all critical methods.
+- Nonce-based replay protection on bridge flow.
+- Min/max bridge amounts and daily volume caps.
+- Optional multi-sig on admin roles is expected in production.
+- Upgrade authorization restricted to `UPGRADER_ROLE`.
+
+## Contracts
+
+### `UMCToken.sol`
+
+Key features:
+- `decimals()` returns 6.
+- Minting controlled by `MINTER_ROLE` + per-minter allowance + global cap.
+- `blacklist()`/`unBlacklist()` enforced in `_update` hook for transfers.
+- `pause()`/`unpause()` implemented via `ERC20PausableUpgradeable`.
+- UUPS upgradeable proxy support with `_authorizeUpgrade` gate.
+
+Core roles:
+- `DEFAULT_ADMIN_ROLE`: grants/revokes roles, sets supply cap, sets minter allowances
+- `MINTER_ROLE`: minting authority
+- `PAUSER_ROLE`: pause/unpause transfers
+- `BLACKLISTER_ROLE`: blacklist management
+- `UPGRADER_ROLE`: upgrade authorization
+
+### `UMCBridgeHedera.sol`
+
+Burn-side contract for Hedera.
+
+Core flow:
+- `bridgeToPolygon(polygonRecipient, amount)` burns UMC from user.
+- Emits `BridgeBurn` including nonce, sender, recipient, gross, fee, net, timestamp.
+- Enforces:
+  - `minBridgeAmount` / `maxBridgeAmount`
+  - `dailyVolumeLimit`
+  - allowance + balance checks
+  - `feeBasisPoints` (basis points)
+
+Nonce handling:
+- `bridgeNonce` increments per burn.
+- `processedNonces` tracks used nonces.
+- `burnRecords` stores canonical burn data used for relayer verification.
+
+### `UMCBridgePolygon.sol`
+
+Mint-side contract for Polygon.
+
+Core flow:
+- `claimMint(hederaNonce, polygonRecipient, amount, deadline, signatures)`
+- Validates:
+  - nonce unused
+  - deadline not expired
+  - required signature count based on amount tier
+  - signer roles and no duplicate signers
+
+EIP-712:
+- `UMCBridge` domain, version `1`
+- `MintAttestation` typed struct with nonce, recipient, amount, deadline
+
+Signature policy:
+- `requiredSignatures` for normal amounts
+- `highValueRequiredSignatures` for amounts ≥ `highValueThreshold`
+
+## Off-Chain Relayer
+
+**Entry point:** `index.ts`
+
+Workflow:
+1. Poll Hedera mirror node logs for `BridgeBurn` events.
+2. Verify each burn on-chain (Hedera bridge contract).
+3. Generate and sign EIP-712 attestations (Polygon relayer key).
+4. Submit `claimMint` on Polygon.
+5. Track status and retry failures.
+
+Key components:
+- `HederaWatcher`: mirror node poller + on-chain verification.
+- `PolygonMinter`: EIP-712 signing + mint submission.
+- `UMCBridgeRelayer`: orchestration, retries, in-memory queue.
+
+Current limitations:
+- No persistence for processed nonces; restart will reprocess unless Polygon already claimed.
+- `confirmationsRequired` in config is not currently used.
+- Mirror node polling is interval-based; no websocket subscription.
+- Relayer relies on a single private key (no threshold relaying).
+
+## Build and Test
+
+Install:
 
 ```bash
-# Install dependencies
 npm install
+```
 
-# Copy and configure environment
-cp .env.example .env
-# Edit .env with your Hedera credentials
+Compile:
 
-# Compile contracts
+```bash
 npm run compile
-
-# Run tests
-npm test
-
-# Deploy to testnet
-npm run deploy:testnet
-
-# Deploy to mainnet (use with caution)
-npm run deploy:mainnet
 ```
 
-## Roles & Permissions
-
-| Role | Can Do |
-|------|--------|
-| `DEFAULT_ADMIN_ROLE` | Grant/revoke roles, set supply cap, set minter allowances |
-| `MINTER_ROLE` | Mint new UMC (within allowance) |
-| `PAUSER_ROLE` | Pause/unpause all transfers |
-| `BLACKLISTER_ROLE` | Blacklist/unblacklist addresses |
-| `UPGRADER_ROLE` | Authorize contract upgrades |
-
-**Recommended production setup**: Use a multi-sig (e.g., Hedera multi-key account or a Gnosis Safe on Hedera EVM) for the admin role. Separate role holders across different keys.
-
-## Operational Workflows
-
-### Minting (Reserve-Backed)
-
-1. User deposits USD to your reserve bank account
-2. Compliance team verifies the deposit
-3. Admin sets minter allowance: `setMinterAllowance(minterAddress, amount)`
-4. Minter calls `mint(recipientAddress, amount)`
-5. UMC is credited to the user's Hedera account
-
-### Redemption
-
-1. User calls `burn(amount)` to destroy UMC
-2. Off-chain system detects the Burn event
-3. USD is wired back to the user's bank account
-
-### Compliance Freeze
-
-```
-blacklist(suspiciousAddress)    // Freeze
-unBlacklist(clearedAddress)     // Unfreeze
-```
-
-### Emergency Pause
-
-```
-pause()    // Halt ALL transfers
-unpause()  // Resume transfers
-```
-
-## Testing
-
-The test suite covers initialization, minting/burning, blacklisting, pausing, supply cap management, minter allowances, upgradeability, and standard ERC-20 transfers.
+Test:
 
 ```bash
 npm test
 ```
 
-## Production Checklist
+## Deployment
 
-- [ ] Deploy behind UUPS proxy (use `upgrades.deployProxy` from Hardhat)
-- [ ] Transfer admin role to multi-sig wallet
-- [ ] Separate role keys (different keys for minter, pauser, blacklister)
-- [ ] Set up off-chain event listeners for Mint/Burn/Blacklisted events
-- [ ] Integrate proof-of-reserves (e.g., Chainlink PoR oracle)
-- [ ] Engage an audit firm (Trail of Bits, OpenZeppelin, Halborn)
-- [ ] Set up monitoring/alerting for unusual activity
-- [ ] Document reserve management procedures
-- [ ] Obtain necessary regulatory licenses
+There are two deployment paths in this repo, and they are currently inconsistent:
+
+1. **Hardhat scripts (recommended for EVM test local dev)**
+   - `package.json` references `scripts/deploy.ts`, but the file lives at repo root as `deploy.ts`.
+   - `hardhat.config.ts` points sources to `./contracts`, but contracts live at repo root.
+
+2. **Hedera SDK deployment (`deploy.ts`)**
+   - Directly uses `@hashgraph/sdk` to deploy the implementation and then calls `initialize`.
+   - It is not deploying a UUPS proxy. The comment calls this out and suggests using ERC1967Proxy in production.
+
+If you plan to run Hardhat compile/test/deploy, align the file layout or config:
+
+- Move solidity files into `contracts/`, and tests into `test/`, or
+- Update `hardhat.config.ts` paths to match the current filesystem.
+
+### Hedera SDK deployment
+
+`deploy.ts` expects `.env`:
+
+- `HEDERA_OPERATOR_ID` (e.g., `0.0.123456`)
+- `HEDERA_OPERATOR_KEY` (DER or hex)
+- `HEDERA_NETWORK` (`testnet`, `mainnet`, `previewnet`)
+- `INITIAL_SUPPLY_CAP` (UMC, human-readable)
+- `INITIAL_MINTER_ALLOWANCE` (UMC, human-readable)
+
+Run:
+
+```bash
+npx ts-node deploy.ts
+```
+
+This will:
+- Deploy implementation
+- Call `initialize`
+- Set minter allowance
+- Output deployment info to `deployments/<network>.json`
+
+## Relayer Configuration
+
+Relayer uses environment variables:
+
+- `HEDERA_OPERATOR_ID`
+- `HEDERA_OPERATOR_KEY`
+- `HEDERA_NETWORK`
+- `HEDERA_BRIDGE_CONTRACT_ID`
+- `POLYGON_RPC_URL`
+- `POLYGON_BRIDGE_ADDRESS`
+- `POLYGON_RELAYER_PRIVATE_KEY`
+- `POLYGON_CHAIN_ID`
+- `POLL_INTERVAL_MS`
+- `CONFIRMATIONS`
+- `MAX_RETRIES`
+- `RETRY_DELAY_MS`
+- `ATTESTATION_TTL`
+- `DATABASE_URL` (currently unused; placeholder for persistence)
+
+Start relayer:
+
+```bash
+npx ts-node index.ts
+```
+
+## Operational Notes
+
+- Use multisig or a hardware-backed key for admin roles.
+- Separate operator roles from admin roles in production.
+- Monitor mirror node availability and latency; the relayer is mirror-dependent.
+- Consider persisting nonces/requests to a DB to make relayer crash-safe.
+- For large-value mints, configure `highValueRequiredSignatures` > 1.
+- UUPS upgrades require explicit `_authorizeUpgrade` role; treat upgrade keys as hot keys with strict control.
+
+## Known Gaps / TODOs
+
+- Hardhat folder layout mismatch (`contracts/` and `scripts/` expected but not present).
+- No production-grade proxy deployment for UUPS in `deploy.ts`.
+- No database persistence for relayer state.
+- No validation that `UMCBridgePolygon` claim window is enforced in relayer.
+- No end-to-end tests for bridge flow.
 
 ## License
 
