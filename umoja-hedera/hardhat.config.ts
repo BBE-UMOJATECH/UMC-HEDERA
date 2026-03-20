@@ -7,13 +7,13 @@ dotenv.config();
 
 const config: HardhatUserConfig = {
   solidity: {
-    version: "0.8.20",
+    version: "0.8.24",
     settings: {
       optimizer: {
         enabled: true,
         runs: 200,
       },
-      evmVersion: "shanghai",
+      evmVersion: "cancun",
     },
   },
   networks: {
@@ -38,12 +38,22 @@ const config: HardhatUserConfig = {
       ],
       chainId: 298,
     },
+    polygonAmoy: {
+      url: process.env.POLYGON_RPC_URL || "https://rpc-amoy.polygon.technology",
+      accounts: process.env.POLYGON_RELAYER_PRIVATE_KEY
+        ? [process.env.POLYGON_RELAYER_PRIVATE_KEY]
+        : [],
+      chainId: 80002,
+    },
   },
   paths: {
     sources: "./contracts",
     tests: "./test",
     cache: "./cache",
     artifacts: "./artifacts",
+  },
+  sourcify: {
+    enabled: true,
   },
 };
 

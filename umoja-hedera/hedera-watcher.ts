@@ -7,6 +7,7 @@ import {
   ContractFunctionParameters,
 } from "@hashgraph/sdk";
 import { ethers } from "ethers";
+import BigNumber from "bignumber.js";
 import { BridgeBurnEvent, RelayerConfig } from "./types";
 
 /**
@@ -18,7 +19,7 @@ import { BridgeBurnEvent, RelayerConfig } from "./types";
 export class HederaWatcher {
   private config: RelayerConfig;
   private mirrorBaseUrl: string;
-  private lastTimestamp: string = "0.0";
+  private lastTimestamp: string = `${Math.floor(Date.now() / 1000)}.000000000`;
   private bridgeContractEvmAddress: string = "";
 
   private readonly BRIDGE_BURN_TOPIC = ethers.id(
@@ -35,7 +36,7 @@ export class HederaWatcher {
 
   async initialize(): Promise<void> {
     const contractId = ContractId.fromString(this.config.hederaBridgeContractId);
-    this.bridgeContractEvmAddress = `0x${contractId.toSolidityAddress()}`.toLowerCase();
+    this.bridgeContractEvmAddress = `0x${contractId.toEvmAddress()}`.toLowerCase();
     console.log(`[HederaWatcher] Watching: ${this.config.hederaBridgeContractId}`);
     console.log(`[HederaWatcher] EVM addr: ${this.bridgeContractEvmAddress}`);
   }
@@ -49,8 +50,10 @@ export class HederaWatcher {
         `/api/v1/contracts/${this.config.hederaBridgeContractId}/results/logs`,
         this.mirrorBaseUrl
       );
+      const nowSeconds = Math.floor(Date.now() / 1000);
       url.searchParams.set("topic0", this.BRIDGE_BURN_TOPIC);
-      url.searchParams.set("timestamp", `gt:${this.lastTimestamp}`);
+      url.searchParams.append("timestamp", `gt:${this.lastTimestamp}`);
+      url.searchParams.append("timestamp", `lt:${nowSeconds}.999999999`);
       url.searchParams.set("order", "asc");
       url.searchParams.set("limit", "100");
 
@@ -140,7 +143,7 @@ export class HederaWatcher {
         .setGas(100_000)
         .setFunction(
           "processedNonces",
-          new ContractFunctionParameters().addUint256(nonce)
+          new ContractFunctionParameters().addUint256(new BigNumber(nonce.toString()))
         );
 
       const result = await query.execute(client);
