@@ -26,6 +26,8 @@ export class HederaWatcher {
     "BridgeBurn(uint256,address,address,uint256,uint256,uint256,uint256)"
   );
 
+  private client: Client | null = null;
+
   constructor(config: RelayerConfig) {
     this.config = config;
     this.mirrorBaseUrl =
@@ -39,6 +41,26 @@ export class HederaWatcher {
     this.bridgeContractEvmAddress = `0x${contractId.toEvmAddress()}`.toLowerCase();
     console.log(`[HederaWatcher] Watching: ${this.config.hederaBridgeContractId}`);
     console.log(`[HederaWatcher] EVM addr: ${this.bridgeContractEvmAddress}`);
+  }
+
+  /** One client for the process — the previous per-call construction leaked gRPC channels. */
+  private getClient(): Client {
+    if (this.client) return this.client;
+    const client =
+      this.config.hederaNetwork === "mainnet"
+        ? Client.forMainnet()
+        : Client.forTestnet();
+    client.setOperator(
+      AccountId.fromString(this.config.hederaOperatorId),
+      PrivateKey.fromStringDer(this.config.hederaOperatorKey)
+    );
+    this.client = client;
+    return client;
+  }
+
+  close(): void {
+    this.client?.close();
+    this.client = null;
   }
 
   /**
@@ -124,19 +146,55 @@ export class HederaWatcher {
   }
 
   /**
+   * Highest nonce issued by the bridge so far. Every nonce below this has a
+   * burn record on-chain, which is what makes reconciliation authoritative:
+   * it never depends on having observed the event.
+   */
+  async getBridgeNonce(): Promise<bigint> {
+    const result = await new ContractCallQuery()
+      .setContractId(this.config.hederaBridgeContractId)
+      .setGas(100_000)
+      .setFunction("bridgeNonce")
+      .execute(this.getClient());
+    return BigInt(result.getUint256(0).toString());
+  }
+
+  /**
+   * Read a burn straight from contract storage, for nonces whose event we
+   * never saw (relayer was down, mirror node dropped the log).
+   */
+  async getBurnRecord(nonce: bigint): Promise<BridgeBurnEvent | null> {
+    const result = await new ContractCallQuery()
+      .setContractId(this.config.hederaBridgeContractId)
+      .setGas(100_000)
+      .setFunction(
+        "getBurnRecord",
+        new ContractFunctionParameters().addUint256(new BigNumber(nonce.toString()))
+      )
+      .execute(this.getClient());
+
+    // BridgeBurnRecord is all static types, so it decodes as a flat tuple:
+    // (hederaSender, polygonRecipient, amount, fee, netAmount, timestamp, exists)
+    if (!result.getBool(6)) return null;
+
+    return {
+      nonce,
+      hederaSender: ethers.getAddress(`0x${result.getAddress(0)}`),
+      polygonRecipient: ethers.getAddress(`0x${result.getAddress(1)}`),
+      amount: BigInt(result.getUint256(2).toString()),
+      fee: BigInt(result.getUint256(3).toString()),
+      netAmount: BigInt(result.getUint256(4).toString()),
+      timestamp: BigInt(result.getUint256(5).toString()),
+      transactionId: `reconciled:${nonce}`,
+    };
+  }
+
+  /**
    * Verify a burn on-chain by querying the bridge contract directly.
    */
   async verifyBurnRecord(nonce: bigint): Promise<boolean> {
     try {
-      const client =
-        this.config.hederaNetwork === "mainnet"
-          ? Client.forMainnet()
-          : Client.forTestnet();
-
-      client.setOperator(
-        AccountId.fromString(this.config.hederaOperatorId),
-        PrivateKey.fromStringDer(this.config.hederaOperatorKey)
-      );
+      const client = this.getClient();
 
       const query = new ContractCallQuery()
         .setContractId(this.config.hederaBridgeContractId)

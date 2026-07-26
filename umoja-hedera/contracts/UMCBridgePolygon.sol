@@ -66,9 +66,12 @@ contract UMCBridgePolygon is
     error InvalidAmount();
     error NonceAlreadyClaimed(uint256 nonce);
     error AttestationExpired(uint256 deadline, uint256 currentTime);
+    error DeadlineExceedsClaimWindow(uint256 deadline, uint256 latestAllowedDeadline);
     error InsufficientSignatures(uint256 provided, uint256 required);
     error InvalidSignature();
     error DuplicateSigner();
+    error InvalidClaimWindow();
+    error InvalidSignatureConfig();
 
     function initialize(
         address _umcToken, address _admin, address _relayer, uint256 _claimWindow
@@ -76,6 +79,7 @@ contract UMCBridgePolygon is
         if (_umcToken == address(0)) revert InvalidAddress();
         if (_admin == address(0)) revert InvalidAddress();
         if (_relayer == address(0)) revert InvalidAddress();
+        if (_claimWindow == 0) revert InvalidClaimWindow();
 
         __AccessControl_init();
         __Pausable_init();
@@ -112,6 +116,10 @@ contract UMCBridgePolygon is
         if (amount == 0) revert InvalidAmount();
         if (claimedNonces[hederaNonce]) revert NonceAlreadyClaimed(hederaNonce);
         if (block.timestamp > deadline) revert AttestationExpired(deadline, block.timestamp);
+        uint256 latestAllowedDeadline = block.timestamp + claimWindow;
+        if (deadline > latestAllowedDeadline) {
+            revert DeadlineExceedsClaimWindow(deadline, latestAllowedDeadline);
+        }
 
         uint256 sigsRequired = amount >= highValueThreshold
             ? highValueRequiredSignatures : requiredSignatures;
@@ -160,6 +168,7 @@ contract UMCBridgePolygon is
     }
 
     function setClaimWindow(uint256 _claimWindow) external onlyRole(DEFAULT_ADMIN_ROLE) {
+        if (_claimWindow == 0) revert InvalidClaimWindow();
         claimWindow = _claimWindow;
         emit ClaimWindowUpdated(_claimWindow);
     }
@@ -167,6 +176,9 @@ contract UMCBridgePolygon is
     function setSignatureConfig(
         uint256 _required, uint256 _hvThreshold, uint256 _hvRequired
     ) external onlyRole(DEFAULT_ADMIN_ROLE) {
+        if (_required == 0 || _hvRequired == 0 || _hvRequired < _required) {
+            revert InvalidSignatureConfig();
+        }
         requiredSignatures = _required;
         highValueThreshold = _hvThreshold;
         highValueRequiredSignatures = _hvRequired;

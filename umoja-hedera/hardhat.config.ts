@@ -39,11 +39,23 @@ const config: HardhatUserConfig = {
       chainId: 298,
     },
     polygonAmoy: {
-      url: process.env.POLYGON_RPC_URL || "https://rpc-amoy.polygon.technology",
+      // rpc-amoy.polygon.technology stopped resolving; publicnode is the fallback.
+      url:
+        process.env.POLYGON_RPC_URL ||
+        "https://polygon-amoy-bor-rpc.publicnode.com",
       accounts: process.env.POLYGON_RELAYER_PRIVATE_KEY
         ? [process.env.POLYGON_RELAYER_PRIVATE_KEY]
         : [],
       chainId: 80002,
+    },
+    polygon: {
+      // No public fallback on purpose: mainnet gets a paid, dedicated endpoint
+      // or nothing. Public RPCs rate-limit and disappear (see Amoy above).
+      url: process.env.POLYGON_MAINNET_RPC_URL || "",
+      accounts: process.env.POLYGON_RELAYER_PRIVATE_KEY
+        ? [process.env.POLYGON_RELAYER_PRIVATE_KEY]
+        : [],
+      chainId: 137,
     },
   },
   paths: {
@@ -52,8 +64,15 @@ const config: HardhatUserConfig = {
     cache: "./cache",
     artifacts: "./artifacts",
   },
+  // Hedera (chain 296/295) isn't a supported Etherscan network; verify via
+  // Sourcify pointed at HashScan's own server (also avoids sourcify.dev brownouts).
+  etherscan: {
+    enabled: false,
+  },
   sourcify: {
     enabled: true,
+    apiUrl: "https://server-verify.hashscan.io",
+    browserUrl: "https://repository-verify.hashscan.io",
   },
 };
 

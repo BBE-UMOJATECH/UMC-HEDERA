@@ -36,7 +36,7 @@ Smart contracts, bridge infrastructure, and off-chain relayer for the UMC Stable
 - EIP-712 signed attestations for secure mint authorisation on Polygon
 - Production-grade relayer with circuit breaking, exponential backoff, and persistent nonce deduplication
 
-The contracts are written in Solidity 0.8.24, use OpenZeppelin's upgradeable library (UUPS pattern), and are deployed to Hedera Testnet and Polygon Amoy.
+The contracts are written in Solidity 0.8.24, use OpenZeppelin's upgradeable library (UUPS pattern), and are live on Hedera Mainnet and Polygon Mainnet.
 
 ---
 
@@ -169,9 +169,12 @@ The **burn side** of the Hedera to Polygon bridge. Users call `bridgeToPolygon()
 2. User calls `UMCBridgeHedera.bridgeToPolygon(polygonRecipient, amount)`
 3. Contract validates amount bounds and daily limit
 4. Calculates `fee = amount * feeBasisPoints / 10_000` and `netAmount = amount - fee`
-5. Calls `UMCToken.burnFrom(msg.sender, amount)` — full gross amount is burned
-6. Stores a `BridgeBurnRecord` keyed by nonce
-7. Emits `BridgeBurn(nonce, hederaSender, polygonRecipient, amount, fee, netAmount, timestamp)`
+5. Calls `UMCToken.burnFrom(msg.sender, netAmount)` — only the net amount is burned
+6. Calls `UMCToken.transferFrom(msg.sender, feeRecipient, fee)` — the fee is paid on-chain
+7. Stores a `BridgeBurnRecord` keyed by nonce
+8. Emits `BridgeBurn(nonce, hederaSender, polygonRecipient, amount, fee, netAmount, timestamp)`
+
+Burning only the net amount keeps **burned-on-Hedera equal to minted-on-Polygon**, so total supply reconciles across both chains without an off-chain ledger of owed fees. The user's approval must cover the full gross amount, since it is spent by both the burn and the fee transfer.
 
 The relayer watches for `BridgeBurn` events and verifies each burn by querying `processedNonces[nonce]` directly on-chain before proceeding.
 
@@ -361,6 +364,19 @@ User (Polygon)
   +-- 8. Receives UMC at their Polygon address
 ```
 
+### Reconciliation
+
+The mirror-node poll in step 3 only ever looks forward from when the relayer started, so on its own it cannot see a burn that landed while the relayer was down. A reconcile sweep runs at startup and every `RECONCILE_INTERVAL_MS` to close that gap:
+
+1. Read `bridgeNonce` from `UMCBridgeHedera` — every nonce below it has an on-chain burn record
+2. For each nonce not already settled, read `getBurnRecord(nonce)` straight from contract storage
+3. Check `UMCBridgePolygon.claimedNonces[nonce]`; if unclaimed, drive it through the normal attestation path
+4. If it *is* claimed, cross-check `claims[nonce]` against the burn record — a mismatch means the Hedera and Polygon bridges come from different deployments and their nonce namespaces have collided
+
+This depends only on authoritative state on both chains, so it also recovers from dropped mirror-node logs. A non-zero backlog is logged as `[WARN] [Reconcile] BACKLOG n unclaimed burn(s)` and is the signal worth alerting on: it means UMC is burned on Hedera but not yet minted on Polygon.
+
+> **Deployment invariant:** the two bridges must be deployed as a pair. `bridgeNonce` restarts at 0 for a fresh `UMCBridgeHedera`, so pointing a new Hedera bridge at a `UMCBridgePolygon` that already has claims will collide. Redeploy both, or the reconcile sweep will flag the collision and dead-letter the affected burns.
+
 ---
 
 ## Security Model
@@ -389,32 +405,43 @@ User (Polygon)
 
 ## Contract Addresses
 
-### Hedera Testnet
+
+### Hedera Mainnet — live
 
 | Contract | Hedera ID | EVM Address |
 |---|---|---|
-| UMCToken | `0.0.8081174` | `0x00000000000000000000000000000000007b4f16` |
-| UMCBridgeHedera | — | `0x45F9cebca7F3A18fAD676D141004fD86728484DD` |
+| UMCToken (proxy) | `0.0.10783066` | `0x45F9cebca7F3A18fAD676D141004fD86728484DD` |
+| UMCToken (impl) | — | `0x5A29ED0349D84c79c423E468cD33B3cd06049457` |
+| UMCBridgeHedera (proxy) | `0.0.10783069` | `0xfc8aE77C4FD8BcaBF7784B7eF139050a8b5C0C4B` |
+| UMCBridgeHedera (impl) | — | `0x74002E30bDb8Cbac3049db039D783467ebaD12Fb` |
 
-- Supply cap: 1,000,000,000 UMC ($1B)
-- Initial minter allowance: 100,000,000 UMC ($100M)
-- Deployer account: `0.0.8064975`
-- Deployed: 2026-03-04
+- Deployer / operator: `0.0.10783060` (`0xEa3A8D8D79CA15758AA13b91fEF437cCB8bb8dD3`)
+- Supply cap: 1,000,000,000 UMC — initial minter allowance 100,000,000 UMC
+- Bridge limits: min 1 UMC, max 100,000 UMC, fee 25 bps, daily cap 1,000,000 UMC
+- Deployed: 2026-07-26
+- All four verified on Sourcify (`exact_match`) via `npx ts-node scripts/verifySourcifyV2.ts`
 
-### Polygon Amoy (Testnet)
+> **Identify Hedera contracts by their `0.0.x` ID, not their EVM address.**
+> `CREATE` derives the address from deployer + nonce, so the same deployer at
+> the same nonce produces an identical EVM address on every Hedera network —
+> `0xfc8aE77C…0C4B` above is not unique to this deployment.
+
+### Polygon Mainnet — live
 
 | Contract | EVM Address |
 |---|---|
-| UMCToken (Polygon) | `0xaD6C18d9E1dfF333007989C192fc0127B72C6387` |
-| UMCBridgePolygon | `0xe9DBE0A46B4d3b15ceab0c79aBA998678AcC20B7` |
+| UMCToken (Polygon, proxy) | `0xc77F608895D140997dDdEBD4e139cb1A53D0cf85` |
+| UMCToken (impl) | `0xaf766F9b026e59D5da7Cb19Fc263469D39112a88` |
+| UMCBridgePolygon (proxy) | `0x017111d2D841228517A6cF806BD4E35C660a7249` |
+| UMCBridgePolygon (impl) | `0xA34D412B5ED8207e4f7871dce4cea5431A047Eef` |
 
-- Deployer: `0x4C3CB0eD1098b4848cB2590E7c7020958037F340`
-- Deployed: 2026-03-18
-- `UMCBridgePolygon` holds `MINTER_ROLE` on the Polygon `UMCToken` with a $100M allowance
+- Deployer / relayer: `0xA1a9E8c73Ecf86AE7F4858D5Cb72E689cDc9eb3e`
+- Admin / upgrader: `0xEa3A8D8D79CA15758AA13b91fEF437cCB8bb8dD3`
+- `UMCBridgePolygon` holds `MINTER_ROLE` on the Polygon `UMCToken` with a 100,000,000 UMC allowance
+- Claim window: 86,400s — `ATTESTATION_TTL` must stay below it
+- Deployed: 2026-07-26
+- All four verified on Sourcify (`exact_match`) via `npx ts-node scripts/verifySourcifyV2.ts polygon`
 
-> Deployment artifacts are persisted in `deployments/testnet.json`, `deployments/hedera-bridge-testnet.json`, and `deployments/polygon-bridge-amoy.json`.
-
----
 
 ## Role Reference
 
@@ -453,13 +480,46 @@ All scripts live in `scripts/` and are executed via Hardhat or `ts-node`.
 
 | Script | Command | Description |
 |---|---|---|
-| `deploy.ts` | `npx hardhat run scripts/deploy.ts --network hederaTestnet` | Deploy `UMCToken` to Hedera, initialise, set minter allowance |
-| `deployBridgeHedera.ts` | `npx hardhat run scripts/deployBridgeHedera.ts --network hederaTestnet` | Deploy `UMCBridgeHedera` (reads token address from `deployments/testnet.json`) |
-| `deployBridgePolygon.ts` | `npx hardhat run scripts/deployBridgePolygon.ts --network polygonAmoy` | Deploy `UMCToken` + `UMCBridgePolygon` on Polygon, wire `MINTER_ROLE` to bridge |
+| `preflight.ts` | `npx hardhat run scripts/preflight.ts --network hederaMainnet` | Pre-deploy checks: funding, key/account consistency, role separation. Run before every deploy |
+| `deploy.ts` | `npx hardhat run scripts/deploy.ts --network hederaMainnet` | Deploy `UMCToken` to Hedera, initialise, set minter allowance |
+| `deployBridgeHedera.ts` | `npx hardhat run scripts/deployBridgeHedera.ts --network hederaMainnet` | Deploy `UMCBridgeHedera` (reads token address from `deployments/mainnet.json`) |
+| `deployBridgePolygon.ts` | `npx hardhat run scripts/deployBridgePolygon.ts --network polygon` | Deploy `UMCToken` + `UMCBridgePolygon` on Polygon, wire `MINTER_ROLE` to bridge |
 | `mint.ts` | `npx ts-node scripts/mint.ts` | Mint UMC tokens to a target address on Hedera |
-| `updateMinterRole.ts` | `npx hardhat run scripts/updateMinterRole.ts --network polygonAmoy` | Grant/revoke `MINTER_ROLE` and set minter allowance |
-| `testBridge.ts` | `npx hardhat run scripts/testBridge.ts --network hederaTestnet` | Full E2E bridge test: mint → approve → burn on Hedera, poll Polygon for mint confirmation |
+| `bridgeToPolygon.ts` | `npm run bridge:polygon -- --amount 10 --hedera-account-id 0.0.12345 --polygon-recipient 0xabc...` | One-shot bridge from Hedera to Polygon: approve UMC, call `bridgeToPolygon`, resolve the burn nonce, and optionally wait for Polygon claim |
+| `updateMinterRole.ts` | `npx hardhat run scripts/updateMinterRole.ts --network polygon` | Grant/revoke `MINTER_ROLE` and set minter allowance |
+| `testBridge.ts` | `npx hardhat run scripts/testBridge.ts --network hederaMainnet` | Full E2E bridge test: mint → approve → burn on Hedera, poll Polygon for mint confirmation |
+| `simulateBridgeUsers.ts` | `npx ts-node scripts/simulateBridgeUsers.ts --once --wait-for-claim` | Drive bridge traffic from the accounts in `SIM_BRIDGE_USERS` |
+| `verifySourcifyV2.ts` | `npx ts-node scripts/verifySourcifyV2.ts [polygon]` | Verify proxies + implementations on Sourcify |
 | `relayer.ts` | `npx ts-node scripts/relayer.ts` | Run the production relayer process |
+
+### `bridgeToPolygon.ts`
+
+Bridges UMC from a Hedera account controlled by `HEDERA_OPERATOR_KEY` to a Polygon recipient. The script:
+
+1. Checks the Hedera sender's HBAR balance and tops it up from `HEDERA_OPERATOR_ID` if needed.
+2. Queries the bridge contract for the expected fee and net amount.
+3. Calls `approve()` on the Hedera UMC token.
+4. Calls `bridgeToPolygon()` on `UMCBridgeHedera`.
+5. Reads the emitted `BridgeBurn` nonce from the Hedera mirror node.
+6. Optionally polls the Polygon bridge until the relayer claims that nonce.
+
+Usage:
+
+```bash
+cd umoja-hedera
+npm run bridge:polygon -- \
+  --amount 10 \
+  --hedera-account-id 0.0.12345 \
+  --polygon-recipient 0xA1a9E8c73Ecf86AE7F4858D5Cb72E689cDc9eb3e \
+  --wait-for-claim
+```
+
+Notes:
+- `--amount` is required and is expressed in UMC units with 6 decimals.
+- `--hedera-account-id` defaults to `HEDERA_OPERATOR_ID`.
+- `--polygon-recipient` defaults to `POLYGON_RECIPIENT`, then `POLYGON_RELAYER_ADDRESS`.
+- `--wait-for-claim` requires `POLYGON_RPC_URL` and `POLYGON_BRIDGE_ADDRESS`.
+- The script burns on Hedera only. The actual Polygon mint still depends on the relayer processing the emitted `BridgeBurn` event.
 
 ---
 
@@ -472,27 +532,97 @@ Create a `.env` file in the `umoja-hedera/` directory:
 HEDERA_OPERATOR_ID=0.0.XXXXXX
 HEDERA_OPERATOR_KEY=<DER-encoded private key>
 HEDERA_OPERATOR_KEY_HEX=<hex private key for Hardhat network config>
-HEDERA_NETWORK=testnet
+HEDERA_NETWORK=mainnet
+HEDERA_TOKEN_CONTRACT_ID=<Hedera contract ID, e.g. 0.0.XXXXXX>
 HEDERA_BRIDGE_CONTRACT_ID=<Hedera contract ID, e.g. 0.0.XXXXXX>
-HEDERA_TESTNET_RPC=https://testnet.hashio.io/api
+HEDERA_BRIDGE_EVM_ADDRESS=<0x... proxy address of UMCBridgeHedera>
+HEDERA_MAINNET_RPC=https://mainnet.hashio.io/api
 
 # Polygon
-POLYGON_RPC_URL=https://rpc-amoy.polygon.technology
-POLYGON_BRIDGE_ADDRESS=0xe9DBE0A46B4d3b15ceab0c79aBA998678AcC20B7
+# relayer.ts requires this exact name and it must point at mainnet.
+POLYGON_RPC_URL=<paid, dedicated Polygon mainnet endpoint>
+POLYGON_BRIDGE_ADDRESS=0x017111d2D841228517A6cF806BD4E35C660a7249
 POLYGON_RELAYER_PRIVATE_KEY=<hex private key for the address holding RELAYER_ROLE>
-POLYGON_CHAIN_ID=80002
+POLYGON_CHAIN_ID=137
 
 # Relayer tuning (optional — defaults shown)
 POLL_INTERVAL_MS=10000
 CONFIRMATIONS=1
 MAX_RETRIES=5
 RETRY_DELAY_MS=30000
-ATTESTATION_TTL=86400
+RECONCILE_INTERVAL_MS=300000
+ATTESTATION_TTL=3600
 
 # Deploy-time only
 INITIAL_SUPPLY_CAP=1000000000
 INITIAL_MINTER_ALLOWANCE=100000000
+
+# Mainnet only — no public fallback is configured on purpose
+POLYGON_MAINNET_RPC_URL=<paid, dedicated Polygon mainnet endpoint>
+
+# Role holders — each defaults to the deploying key when unset
+ADMIN_ADDRESS=<0x... ideally a multisig; DEFAULT_ADMIN_ROLE>
+UPGRADER_ADDRESS=<0x... can replace contract logic; defaults to ADMIN_ADDRESS>
+OPERATOR_ADDRESS=<0x... pause/unpause; defaults to ADMIN_ADDRESS>
+PAUSER_ADDRESS=<0x... token pause; defaults to ADMIN_ADDRESS>
+BLACKLISTER_ADDRESS=<0x... token freeze; defaults to ADMIN_ADDRESS>
+MINTER_ADDRESS=<0x... mints UMC on Hedera; defaults to the deployer>
+RELAYER_ADDRESS=<0x... signs attestations; MUST differ from UPGRADER_ADDRESS>
+FEE_RECIPIENT_ADDRESS=<0x... receives bridge fees; defaults to ADMIN_ADDRESS>
+REVOKE_DEPLOYER_ROLES=false   # set true on mainnet to strip the deploying key
 ```
+
+### Controlling who holds which role
+
+By default every role goes to the deploying key, which puts total control of a live stablecoin behind one hot key. Set the `*_ADDRESS` variables above to split them. The deploy scripts:
+
+1. Initialise the contract with the **deployer** as admin, so the remaining setup steps (`setMinterAllowance`, granting the bridge `MINTER_ROLE`) can run
+2. Grant each role to its configured holder
+3. Only then, if `REVOKE_DEPLOYER_ROLES=true`, strip the deployer — non-admin roles first, `DEFAULT_ADMIN_ROLE` last
+
+Step 3 refuses to touch anything unless every intended holder already has its role, because a partial revocation is its own outage: strip `MINTER_ROLE` from the deployer while the replacement minter never received it and nobody can mint until an admin intervenes. Revoking `DEFAULT_ADMIN_ROLE` with no valid replacement is unrecoverable, so that check is a hard failure, not a warning. `test/roles.test.ts` covers all four paths.
+
+The one pairing to get right is **`RELAYER_ADDRESS` must not equal `UPGRADER_ADDRESS`**. The relayer key is online and signing continuously; if it can also upgrade the contracts, compromising it means losing everything rather than losing one signer. Preflight fails on this for mainnet.
+
+On Polygon, `MINTER_ROLE` on the token is handed to the **bridge contract** — UMC there exists only as the mint side of a Hedera burn, so no human key should be able to mint it.
+
+---
+
+## Mainnet Deployment
+
+Run preflight before each step. It exits non-zero on anything blocking.
+
+```bash
+npm run preflight -- --network hederaMainnet
+npm run deploy:mainnet              # UMCToken proxy on Hedera
+npm run deploy:bridge-hedera        # UMCBridgeHedera proxy
+
+npm run preflight -- --network polygon
+npm run deploy:bridge-polygon       # UMCToken + UMCBridgePolygon
+```
+
+Then update `.env` with the four addresses, `npm run build` from the repo root, and restart the relayer.
+
+What preflight checks:
+
+| Check | Why |
+|---|---|
+| Deployer balance vs a per-chain minimum | A deploy that halts midway leaves a token proxy with no bridge holding `MINTER_ROLE` |
+| Hedera `0.0.x` EVM alias matches the hex key's address | Otherwise `deploy.ts` (hardhat) and `mint.ts` (SDK) are different identities and roles land on an address the minting path cannot use |
+| `POLYGON_CHAIN_ID` matches the RPC | It is part of the EIP-712 domain; a mismatch produces unclaimable attestations |
+| `ATTESTATION_TTL` < claim window | Equal values revert intermittently with `DeadlineExceedsClaimWindow` |
+| Max bridge amount vs the high-value threshold | A burn above the threshold needs 2 signatures but the relayer submits 1 — those burns would be unclaimable |
+| `RELAYER_ADDRESS` ≠ `UPGRADER_ADDRESS`, roles off the deployer | Blast radius of the online signing key |
+
+> **Deploy both bridges together.** `bridgeNonce` restarts at 0 for a fresh `UMCBridgeHedera`, so pairing it with an existing `UMCBridgePolygon` collides on already-claimed nonces.
+
+Notes on the values that are easy to get wrong:
+
+| Variable | Why it matters |
+|---|---|
+| `POLYGON_CHAIN_ID` | Required, never defaulted. It is part of the EIP-712 domain, so a wrong value produces attestations that recover to a non-relayer address and fail at `claimMint`. `PolygonMinter` asserts it against the RPC at boot and refuses to start on a mismatch. |
+| `ATTESTATION_TTL` | Must stay **below** the Polygon bridge's `claimWindow` (default 86400). The relayer signs `deadline` off the local clock while `claimMint` compares against block time, so a TTL equal to the window reverts intermittently with `DeadlineExceedsClaimWindow`. |
+| `RECONCILE_INTERVAL_MS` | How often the relayer re-checks Hedera burns against Polygon claims. Lower means faster recovery from a missed burn, at the cost of more RPC calls. |
 
 ---
 
@@ -510,15 +640,18 @@ npx hardhat compile
 # Run unit tests
 npx hardhat test
 
-# Deploy UMCToken to Hedera Testnet
-npx hardhat run scripts/deploy.ts --network hederaTestnet
+# Pre-deploy checks — run before every deploy
+npx hardhat run scripts/preflight.ts --network hederaMainnet
+
+# Deploy UMCToken to Hedera
+npx hardhat run scripts/deploy.ts --network hederaMainnet
 
 # Deploy bridge contracts
-npx hardhat run scripts/deployBridgeHedera.ts --network hederaTestnet
-npx hardhat run scripts/deployBridgePolygon.ts --network polygonAmoy
+npx hardhat run scripts/deployBridgeHedera.ts --network hederaMainnet
+npx hardhat run scripts/deployBridgePolygon.ts --network polygon
 
 # Run the E2E bridge test
-npx hardhat run scripts/testBridge.ts --network hederaTestnet
+npx hardhat run scripts/testBridge.ts --network hederaMainnet
 
 # Start the production relayer
 npx ts-node scripts/relayer.ts
@@ -559,5 +692,4 @@ The `src/shared/hedera-bridge/` worker in the main API is the internal consumer 
 
 
 ---
-
 

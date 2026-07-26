@@ -11,6 +11,7 @@ import "@openzeppelin/contracts-upgradeable/proxy/utils/UUPSUpgradeable.sol";
  */
 interface IUMCToken {
     function burnFrom(address account, uint256 amount) external;
+    function transferFrom(address from, address to, uint256 amount) external returns (bool);
     function allowance(address owner, address spender) external view returns (uint256);
     function balanceOf(address account) external view returns (uint256);
 }
@@ -208,10 +209,13 @@ contract UMCBridgeHedera is
         uint256 fee = (amount * feeBasisPoints) / 10_000;
         uint256 netAmount = amount - fee;
 
-        // Burn the full amount from the user
-        // Fee portion is also burned — the fee recipient is compensated
-        // off-chain or via a separate mechanism to keep this simple
-        umcToken.burnFrom(msg.sender, amount);
+        // Burn only the net amount, so burned-on-Hedera always equals
+        // minted-on-Polygon and the peg reconciles without an off-chain ledger.
+        // The fee moves to feeRecipient on-chain instead of being destroyed.
+        umcToken.burnFrom(msg.sender, netAmount);
+        if (fee > 0) {
+            umcToken.transferFrom(msg.sender, feeRecipient, fee);
+        }
 
         // Update daily volume
         dailyVolume += amount;
